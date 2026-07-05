@@ -2,6 +2,7 @@
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
+import { normaliseStrmUrl } from './strm';
 
 const STRM_ROOT = path.resolve(process.env.STRM_ROOT ?? '/strm');
 const PORT = Number(process.env.PORT ?? 3000);
@@ -34,16 +35,22 @@ http
       }
     }
 
+    let raw: string;
     try {
-      const url = fs.readFileSync(filePath, 'utf-8').trim();
-      if (!url.startsWith('http://') && !url.startsWith('https://')) {
-        res.writeHead(422).end('Not an HTTP URL');
-        return;
-      }
-      console.log(`302  ${decodedPath}  ->  ${url}`);
-      res.writeHead(302, { Location: url }).end();
+      raw = fs.readFileSync(filePath, 'utf-8').trim();
     } catch {
       res.writeHead(404).end('Not found');
+      return;
     }
+
+    // Normalise before redirecting -- raw spaces or non-ASCII characters in the
+    // Location header are rejected by Node and by upstream servers
+    const url = normaliseStrmUrl(raw);
+    if (!url) {
+      res.writeHead(422).end('Not a valid HTTP URL');
+      return;
+    }
+    console.log(`302  ${decodedPath}  ->  ${url}`);
+    res.writeHead(302, { Location: url }).end();
   })
   .listen(PORT, () => console.log(`strm-proxy on :${PORT}  root: ${STRM_ROOT}`));
