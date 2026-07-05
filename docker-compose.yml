@@ -2,13 +2,9 @@ services:
   strm-proxy:
     build: .
     container_name: strm-proxy
+    # All other settings use the image defaults (see README Configuration)
     environment:
-      - STRM_ROOT=/strm
-      - PORT=3000
-      - STRM_PROXY_HOST=strm-proxy
-      - "DB_PATH=/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
       - SKIP_SETUP=${SKIP_SETUP:-false}
-      - CONTAINER_PREFIX=/media/strm
     volumes:
       - ./strm:/strm:ro
       - ./plex-config:/plex-config

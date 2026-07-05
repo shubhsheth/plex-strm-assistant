@@ -7,46 +7,30 @@ Enables `.strm` file playback in Plex. Plex dropped native `.strm` support, so t
 
 ![Plex Media Info showing proxy URL and H.264 direct play](docs/media-info.png)
 
-- **strm-proxy** — a lightweight HTTP server that reads a `.strm` file and returns a `302` redirect to the URL inside it.
-- **SQLite triggers** — installed once into the Plex database. Whenever Plex scans a `.strm` file, the trigger rewrites the stored path to a proxy URL (`http://strm-proxy:3000/...`). Rescans are handled automatically — no re-patching needed.
+- **strm-proxy**: a lightweight HTTP server that reads a `.strm` file and returns a `302` redirect to the URL inside it.
+- **SQLite triggers**: installed once into the Plex database. Whenever Plex scans a `.strm` file, the trigger rewrites the stored path to a proxy URL (`http://strm-proxy:3000/...`). Rescans are handled automatically, so no re-patching is needed.
 
 ---
 
-## Prerequisites
+## Quick start (Docker Compose)
 
-- Docker
-- A Plex Media Server (Dockerised or native) that has completed initial setup at least once
+This is the recommended setup. Plex and the proxy run in the same Compose file and share a Docker network, so the proxy is reachable at `strm-proxy` without exposing an IP address.
 
----
+**Prerequisites:** Docker with the Compose plugin.
 
-## `.strm` file format
+### 1. Create the project folder
 
-Each `.strm` file contains a single HTTP/HTTPS URL:
-
-```text
-https://example.com/path/to/video.mp4
+```bash
+mkdir plex-strm && cd plex-strm
+mkdir strm plex-config
 ```
 
-Organise them the same way you would real media files:
+- `strm/` holds your `.strm` files (see [.strm file format](#strm-file-format) below)
+- `plex-config/` persists the Plex configuration and database
 
-```text
-strm/
-  Movies/
-    Big Buck Bunny (2008)/
-      Big Buck Bunny (2008).strm
-  TV Shows/
-    Some Show/
-      Season 01/
-        Some Show - S01E01.strm
-```
+### 2. Create `docker-compose.yml`
 
----
-
-## Setup
-
-Running Plex and the proxy in the same Docker Compose file is recommended. Both containers share a Docker network, so the proxy is reachable at `strm-proxy` without needing to expose an IP address.
-
-### 1. Create a `docker-compose.yml`
+All proxy settings have sensible defaults built into the image, so no environment configuration is needed for this layout:
 
 ```yaml
 services:
@@ -54,12 +38,7 @@ services:
     image: liveinaus/plex-strm-assistant
     container_name: strm-proxy
     environment:
-      - STRM_ROOT=/strm
-      - PORT=3000
-      - STRM_PROXY_HOST=strm-proxy
-      - "DB_PATH=/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db"
       - SKIP_SETUP=${SKIP_SETUP:-false}
-      - CONTAINER_PREFIX=/media/strm
     volumes:
       - ./strm:/strm:ro
       - ./plex-config:/plex-config
@@ -84,52 +63,104 @@ services:
     restart: unless-stopped
 ```
 
-Place your `.strm` files under `./strm/` and Plex config will be persisted under `./plex-config/`.
+> **Tip:** to link Plex to your account, get a claim token from [plex.tv/claim](https://www.plex.tv/claim/) (valid for 4 minutes) and start with `PLEX_CLAIM=claim-xxxx docker compose up plex`.
 
-### 2. First run — let Plex initialise
+### 3. Start Plex alone and let it initialise
 
-Start Plex on its own so it can create its database:
+Plex needs to create its database before the triggers can be installed:
 
 ```bash
-docker compose up plex
+docker compose up -d plex
 ```
 
-Wait until Plex is accessible at `http://localhost:32400/web` and complete the initial setup. Then stop it:
+Open `http://localhost:32400/web` and complete the initial setup wizard. Then stop Plex:
 
 ```bash
 docker compose stop plex
 ```
 
-### 3. Install triggers
+> **Important:** Plex must be stopped for the next step. Writing to the Plex database while Plex is running risks database corruption.
 
-> **Important:** Plex must be stopped during trigger installation. Writing to the Plex database while Plex is running risks database corruption.
-
-Start the proxy — it will install the SQLite triggers then start serving:
+### 4. Start the proxy to install the triggers
 
 ```bash
 docker compose up strm-proxy
 ```
 
-Wait for:
+Wait for this output, which confirms the triggers are installed:
 
 ```text
 strm-proxy | Setup complete. Plex rescans and new .strm files are now handled automatically.
 strm-proxy | strm-proxy on :3000  root: /strm
 ```
 
-### 4. Start everything
+Press `Ctrl+C` to stop it.
+
+### 5. Start everything
 
 ```bash
 docker compose up -d
 ```
 
-Add a library in Plex pointing at `/media/strm` and run a scan. Files will be playable immediately.
+In Plex, add a library pointing at `/media/strm` and run a scan. Files will be playable immediately.
 
 ---
 
-## Standalone usage (proxy only)
+## .strm file format
 
-If Plex is already running outside of Docker Compose, you can run the proxy on its own. Set `STRM_PROXY_HOST` to a hostname or IP reachable by both the Plex server and your Plex clients.
+Each `.strm` file contains a single HTTP/HTTPS URL:
+
+```text
+https://example.com/path/to/video.mp4
+```
+
+Organise them under `strm/` the same way you would real media files:
+
+```text
+strm/
+  Movies/
+    Big Buck Bunny (2008)/
+      Big Buck Bunny (2008).strm
+  TV Shows/
+    Some Show/
+      Season 01/
+        Some Show - S01E01.strm
+```
+
+New `.strm` files are picked up automatically on the next Plex scan. No proxy restart is required.
+
+---
+
+## Restarting the proxy
+
+The triggers only need to be installed once. To restart the proxy at any time without stopping Plex, set `SKIP_SETUP=true` so trigger installation is skipped:
+
+```bash
+SKIP_SETUP=true docker compose up -d strm-proxy
+```
+
+---
+
+## Configuration
+
+All variables are optional. The defaults match the Quick start layout, so you only need these if your mount paths or hostnames differ.
+
+| Variable           | Default                                                                                                               | Description                                                             |
+| ------------------ | --------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------- |
+| `PORT`             | `3000`                                                                                                                | Port the proxy listens on (also used to build stored proxy URLs)        |
+| `STRM_PROXY_HOST`  | `strm-proxy`                                                                                                          | Hostname used in proxy URLs stored in the Plex DB                       |
+| `STRM_ROOT`        | `/strm`                                                                                                               | Mount point for `.strm` files inside the proxy container                |
+| `CONTAINER_PREFIX` | `/media/strm`                                                                                                         | Path where `.strm` files are mounted inside the Plex container          |
+| `DB_PATH`          | `/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db` | Full path to the Plex database inside the proxy container               |
+| `SKIP_SETUP`       | `false`                                                                                                               | Set to `true` to skip trigger installation (safe while Plex is running) |
+
+---
+
+## Alternative setups
+
+### Standalone (Plex runs elsewhere)
+
+If Plex is already running outside of Docker Compose, run the proxy on its own. Set `STRM_PROXY_HOST` to a hostname or IP reachable by both the Plex server and your Plex clients. The first-run order still applies: stop Plex before the first start of the proxy so the triggers can be installed safely.
 
 ```bash
 docker run -d \
@@ -141,11 +172,9 @@ docker run -d \
   liveinaus/plex-strm-assistant
 ```
 
----
+### Multiple `.strm` directories
 
-## Multiple `.strm` directories
-
-If your `.strm` files live in separate directories, mount each one as a subdirectory under `/strm`. The trigger matches everything under the prefix recursively so no code changes are needed.
+If your `.strm` files live in separate directories, mount each one as a subdirectory under `/strm`. The trigger matches everything under the prefix recursively, so no code changes are needed.
 
 ```bash
 docker run -d \
@@ -162,32 +191,15 @@ Mount the same directories into Plex under `/media/strm/Movies` and `/media/strm
 
 ---
 
-## Environment variables
+## Troubleshooting
 
-| Variable | Default | Description |
-| --- | --- | --- |
-| `PORT` | `3000` | Port the proxy listens on (also used to build stored proxy URLs) |
-| `STRM_PROXY_HOST` | `strm-proxy` | Hostname used in proxy URLs stored in the Plex DB |
-| `STRM_ROOT` | `/strm` | Mount point for `.strm` files inside the proxy container |
-| `CONTAINER_PREFIX` | `/media/strm` | Path where `.strm` files are mounted inside the Plex container |
-| `DB_PATH` | *(see Dockerfile)* | Full path to `com.plexapp.plugins.library.db` inside the proxy container |
-| `SKIP_SETUP` | `false` | Set to `true` to skip trigger installation on container start (safe while Plex is running) |
+### Proxy logs "Waiting for Plex DB"
 
----
+The proxy could not find the Plex database at `DB_PATH`. Make sure Plex has been started at least once (step 3 of the Quick start) and that the Plex config directory is mounted at `/plex-config` in the proxy container.
 
-## Restarting the proxy
+### "Database disk image is malformed"
 
-The proxy can be restarted at any time without stopping Plex by setting `SKIP_SETUP=true`:
-
-```bash
-docker run ... -e SKIP_SETUP=true liveinaus/plex-strm-assistant
-```
-
----
-
-## Database recovery
-
-If Plex reports *"database disk image is malformed"*:
+If Plex reports this, recover the database:
 
 ```bash
 # Stop Plex first
@@ -205,17 +217,17 @@ rm -f "${DB}-wal" "${DB}-shm"
 - [x] HTTP proxy that resolves `.strm` files to stream URLs via `302` redirect
 - [x] SQLite triggers to survive Plex rescans automatically
 - [x] Inject H.264/AAC codec metadata to force direct play (no transcoding)
-- [x] Docker container — installs triggers on start, then runs proxy
+- [x] Docker container that installs triggers on start, then runs the proxy
 - [x] Multi-platform image (amd64, arm64)
-- [x] Safe first-run handling — waits for Plex DB, `SKIP_SETUP` flag for restarts
+- [x] Safe first-run handling: waits for the Plex DB, `SKIP_SETUP` flag for restarts
 - [ ] Disable unnecessary Plex processing on `.strm` items (analysis, thumbnail generation, etc.)
-- [ ] Follow 302 redirects from the source URL before returning to Plex — enables compatibility with services that require a redirect step (e.g. 115 Drive)
+- [ ] Follow 302 redirects from the source URL before returning to Plex, enabling compatibility with services that require a redirect step (e.g. 115 Drive)
 
 ---
 
 ## Contributing
 
-Contributions are welcome! Whether it's a bug fix, a new feature, or an idea from the roadmap — feel free to open an issue or submit a pull request.
+Contributions are welcome! Whether it's a bug fix, a new feature, or an idea from the roadmap, feel free to open an issue or submit a pull request.
 
 If you'd like to get more involved and collaborate on the project long-term, reach out via GitHub. All skill levels are welcome.
 
@@ -242,4 +254,4 @@ The author accepts no responsibility for data loss, database corruption, account
 
 ## Licence
 
-MIT — free to use and modify. You must retain the copyright notice and a link back to this repository in any copies or derivatives. See [LICENSE](LICENSE) for the full text.
+MIT: free to use and modify. You must retain the copyright notice and a link back to this repository in any copies or derivatives. See [LICENSE](LICENSE) for the full text.
