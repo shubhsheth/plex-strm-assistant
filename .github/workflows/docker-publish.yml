@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - package.json
+      - README.md
 
 jobs:
   build-and-push:
@@ -57,3 +58,16 @@ jobs:
             ${{ secrets.DOCKERHUB_USERNAME }}/plex-strm-assistant:${{ steps.version.outputs.value }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      # Runs on every push to main that touches package.json or README.md,
+      # regardless of whether a new image version was published
+      - name: Update Docker Hub overview
+        uses: peter-evans/dockerhub-description@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          repository: ${{ secrets.DOCKERHUB_USERNAME }}/plex-strm-assistant
+          short-description: ${{ github.event.repository.description }}
+          readme-filepath: ./README.md
+          # Rewrites relative links (docs/media-info.png, LICENSE) to absolute GitHub URLs
+          enable-url-completion: true
