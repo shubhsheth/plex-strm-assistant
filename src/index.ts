@@ -9,7 +9,7 @@ import {
   openDb,
   updatePartFile,
 } from './db';
-import { readStrmUrl, walkStrm } from './strm';
+import { readStrmUrl, toContainerPath, toProxyUrl, walkStrm } from './strm';
 
 // Read at runtime rather than imported: package.json sits outside rootDir, so
 // importing it would break the dist layout. Resolves from both src/ and dist/.
@@ -46,37 +46,6 @@ const opts = program.opts<{
   scanStrm: string;
   rebase: string;
 }>();
-
-/** Converts a local on-disk path to the container path Plex recorded in its DB. */
-function toContainerPath(localPath: string, rebase: string): string {
-  const sep = rebase.indexOf(':');
-  if (sep === -1) return localPath;
-  // path.resolve normalises any ".." segments that the shell may leave unresolved
-  const localPrefix = path.resolve(rebase.slice(0, sep));
-  const containerPrefix = rebase.slice(sep + 1);
-  return localPath.startsWith(localPrefix)
-    ? containerPrefix + localPath.slice(localPrefix.length)
-    : localPath;
-}
-
-/**
- * Builds the stable proxy URL for a container path.
- * Each path segment is percent-encoded so spaces and special chars are valid in the URL.
- * e.g. /media/strm/Movies/Big Buck Bunny (2008)/Big Buck Bunny (2008).strm
- *   -> http://strm-proxy:3000/Movies/Big%20Buck%20Bunny%20(2008)/Big%20Buck%20Bunny%20(2008).strm
- */
-function toProxyUrl(containerPath: string, rebase: string, proxyBase: string): string {
-  const sep = rebase.indexOf(':');
-  const containerRoot = sep === -1 ? '' : rebase.slice(sep + 1);
-  const relativePath = containerPath.startsWith(containerRoot)
-    ? containerPath.slice(containerRoot.length)
-    : containerPath;
-  const encodedPath = relativePath
-    .split('/')
-    .map((seg) => encodeURIComponent(seg))
-    .join('/');
-  return proxyBase.replace(/\/$/, '') + encodedPath;
-}
 
 console.log(`Plex database: ${opts.db}`);
 console.log(`Scanning:      ${opts.scanStrm}`);

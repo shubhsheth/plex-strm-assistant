@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import path from 'path';
 import os from 'os';
+import type { ProbeResult, ProbeStream } from './probe';
 
 export type StrmPart = {
   id: number;
@@ -111,6 +112,11 @@ function parseStrmSource(extraData: string | null): string | null {
 }
 
 function injectStrmSource(extraData: string | null, strmPath: string): string {
+  return mergeExtraData(extraData, { strm_source: strmPath });
+}
+
+/** Merges keys into the JSON object stored in media_parts.extra_data. */
+function mergeExtraData(extraData: string | null, fields: Record<string, unknown>): string {
   let obj: Record<string, unknown> = {};
   if (extraData) {
     try {
@@ -119,8 +125,20 @@ function injectStrmSource(extraData: string | null, strmPath: string): string {
       obj = { _raw: extraData };
     }
   }
-  obj['strm_source'] = strmPath;
+  Object.assign(obj, fields);
   return JSON.stringify(obj);
+}
+
+/** Reads a string field from the JSON object in media_parts.extra_data, or null. */
+export function parseExtraDataField(extraData: string | null, key: string): string | null {
+  if (!extraData) return null;
+  try {
+    const obj = JSON.parse(extraData) as Record<string, unknown>;
+    const val = obj[key];
+    return typeof val === 'string' ? val : null;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -149,6 +167,206 @@ export function guardTriggerExists(db: DatabaseSync): boolean {
     .prepare(`SELECT 1 FROM sqlite_master WHERE type = 'trigger' AND name = 'strm_proxy_guard'`)
     .get();
   return row != null;
+}
+
+// -- probe results -> Plex DB --
+
+export type ProbeWriteOutcome = {
+  streamsWritten: number;
+  itemUpdated: boolean;
+  partUpdated: boolean;
+};
+
+/**
+ * Writes real ffprobe results into the Plex DB, replacing the placeholder
+ * streams with per-track rows and accurate media_items / media_parts fields.
+ *
+ * Robust to Plex schema differences across versions: every table's columns are
+ * introspected with PRAGMA table_info and only existing columns are written, so
+ * a column missing on one Plex version is skipped rather than erroring.
+ *
+ * Replacement is scoped to *embedded* streams (media_streams.url IS NULL) --
+ * the placeholders this tool seeds. Sidecar subtitles Plex discovered carry a
+ * url and are left untouched.
+ *
+ * `probeSig` is stored in media_parts.extra_data so the probe pass can skip a
+ * part whose source URL is unchanged on the next run.
+ */
+export function writeProbedStreams(
+  db: DatabaseSync,
+  part: StrmPart,
+  probe: ProbeResult,
+  probeSig: string,
+  dryRun: boolean,
+): ProbeWriteOutcome {
+  const streamCols = tableColumns(db, 'media_streams');
+  const itemCols = tableColumns(db, 'media_items');
+  const partCols = tableColumns(db, 'media_parts');
+  const now = Math.floor(Date.now() / 1000);
+
+  // 1. Replace embedded streams (keep Plex-discovered sidecar rows: url NOT NULL)
+  if (!dryRun) {
+    db.prepare(`DELETE FROM media_streams WHERE media_part_id = ? AND url IS NULL`).run(part.id);
+  }
+  for (const stream of probe.streams) {
+    insertStream(db, part, stream, streamCols, now, dryRun);
+  }
+
+  // 2. media_items: codecs + geometry from the primary video/audio streams
+  const video = probe.streams.find(
+    (s): s is Extract<ProbeStream, { kind: 'video' }> => s.kind === 'video',
+  );
+  const audio = probe.streams.find(
+    (s): s is Extract<ProbeStream, { kind: 'audio' }> => s.kind === 'audio',
+  );
+  const itemUpdates: Record<string, SqlValue> = {};
+  if (video?.codec) itemUpdates['video_codec'] = video.codec;
+  if (audio?.codec) itemUpdates['audio_codec'] = audio.codec;
+  if (probe.container) itemUpdates['container'] = probe.container;
+  if (video?.width != null) itemUpdates['width'] = video.width;
+  if (video?.height != null) {
+    itemUpdates['height'] = video.height;
+    itemUpdates['video_resolution'] = resolutionLabel(video.height);
+  }
+  if (video?.width != null && video?.height != null && video.height !== 0) {
+    itemUpdates['aspect_ratio'] = Math.round((video.width / video.height) * 100) / 100;
+  }
+  if (video?.frameRate != null) itemUpdates['frames_per_second'] = video.frameRate;
+  if (audio?.channels != null) itemUpdates['audio_channels'] = audio.channels;
+  if (probe.bitrate != null) itemUpdates['bitrate'] = Math.round(probe.bitrate / 1000); // kbps
+  if (probe.durationSec != null) itemUpdates['duration'] = Math.round(probe.durationSec * 1000); // ms
+  const itemUpdated = runUpdate(
+    db,
+    'media_items',
+    itemUpdates,
+    itemCols,
+    'id',
+    part.mediaItemId,
+    dryRun,
+  );
+
+  // 3. media_parts: duration/size + probe bookkeeping in extra_data
+  const partUpdates: Record<string, SqlValue> = {
+    extra_data: mergeExtraData(part.extraData, { probe_sig: probeSig, probed_at: now }),
+  };
+  if (probe.durationSec != null) partUpdates['duration'] = Math.round(probe.durationSec * 1000);
+  if (probe.sizeBytes != null) partUpdates['size'] = probe.sizeBytes;
+  const partUpdated = runUpdate(db, 'media_parts', partUpdates, partCols, 'id', part.id, dryRun);
+
+  return { streamsWritten: probe.streams.length, itemUpdated, partUpdated };
+}
+
+type SqlValue = string | number | null;
+
+/** Inserts one probed stream, writing only columns present in this Plex schema. */
+function insertStream(
+  db: DatabaseSync,
+  part: StrmPart,
+  s: ProbeStream,
+  cols: Set<string>,
+  now: number,
+  dryRun: boolean,
+): void {
+  const row: Record<string, SqlValue> = {
+    stream_type_id: s.kind === 'video' ? 1 : s.kind === 'audio' ? 2 : 3,
+    media_item_id: part.mediaItemId,
+    media_part_id: part.id,
+    codec: s.codec || null,
+    index: s.index,
+    url: null,
+    created_at: now,
+    updated_at: now,
+  };
+  if (s.kind === 'audio') row['channels'] = s.channels;
+  if (s.kind !== 'video') row['language'] = s.language;
+  if ((s.kind === 'video' || s.kind === 'audio') && s.bitrate != null) {
+    row['bitrate'] = Math.round(s.bitrate / 1000); // kbps
+  }
+  const extra = encodeStreamExtraData(s);
+  if (extra) row['extra_data'] = extra;
+
+  const keys = Object.keys(row).filter((k) => cols.has(k));
+  if (keys.length === 0 || dryRun) return;
+  const sql = `INSERT INTO media_streams (${keys.map((k) => `"${k}"`).join(', ')}) VALUES (${keys
+    .map(() => '?')
+    .join(', ')})`;
+  db.prepare(sql).run(...keys.map((k) => row[k]));
+}
+
+/**
+ * Best-effort per-stream attributes for media_streams.extra_data, using Plex's
+ * `ma:`-namespaced URL-encoded form. First-class columns above carry the data
+ * Plex reliably displays; these deeper attributes (profile, bit depth, colour,
+ * forced/default, track title) are layered on top and should be spot-checked
+ * against a live Plex DB, as the exact key set varies by Plex version.
+ */
+function encodeStreamExtraData(s: ProbeStream): string {
+  const kv: Record<string, string | number> = {};
+  if (s.kind === 'video') {
+    if (s.profile) kv['ma:profile'] = s.profile;
+    if (s.bitDepth != null) kv['ma:bitDepth'] = s.bitDepth;
+    if (s.colorSpace) kv['ma:colorSpace'] = s.colorSpace;
+    if (s.frameRate != null) kv['ma:frameRate'] = s.frameRate;
+    if (s.level != null) kv['ma:level'] = s.level;
+  } else if (s.kind === 'audio') {
+    if (s.channelLayout) kv['ma:audioChannelLayout'] = s.channelLayout;
+    if (s.sampleRate != null) kv['ma:samplingRate'] = s.sampleRate;
+    if (s.title) kv['ma:title'] = s.title;
+    if (s.default) kv['ma:default'] = 1;
+    if (s.forced) kv['ma:forced'] = 1;
+  } else {
+    if (s.title) kv['ma:title'] = s.title;
+    if (s.forced) kv['ma:forced'] = 1;
+    if (s.default) kv['ma:default'] = 1;
+  }
+  return Object.entries(kv)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join('&');
+}
+
+/** Maps a pixel height to Plex's video_resolution label. */
+function resolutionLabel(height: number): string {
+  if (height >= 2000) return '4k';
+  if (height >= 1400) return '1440';
+  if (height >= 900) return '1080';
+  if (height >= 700) return '720';
+  if (height >= 560) return '576';
+  if (height >= 460) return '480';
+  return 'sd';
+}
+
+/** Runs a dynamic UPDATE, writing only columns present in the table. Returns true if it wrote. */
+function runUpdate(
+  db: DatabaseSync,
+  table: string,
+  updates: Record<string, SqlValue>,
+  cols: Set<string>,
+  whereCol: string,
+  whereVal: SqlValue,
+  dryRun: boolean,
+): boolean {
+  const keys = Object.keys(updates).filter((k) => cols.has(k));
+  if (keys.length === 0) return false;
+  if (dryRun) return true;
+  const setSql = keys.map((k) => `"${k}" = ?`).join(', ');
+  const touch = cols.has('updated_at') ? `, "updated_at" = strftime('%s','now')` : '';
+  db.prepare(`UPDATE ${table} SET ${setSql}${touch} WHERE "${whereCol}" = ?`).run(
+    ...keys.map((k) => updates[k]),
+    whereVal,
+  );
+  return true;
+}
+
+const columnCache = new Map<string, Set<string>>();
+
+/** Returns the set of column names for a table (cached), via PRAGMA table_info. */
+function tableColumns(db: DatabaseSync, table: string): Set<string> {
+  const cached = columnCache.get(table);
+  if (cached) return cached;
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+  const cols = new Set(rows.map((r) => r.name));
+  columnCache.set(table, cols);
+  return cols;
 }
 
 export { DEFAULT_DB_PATH };

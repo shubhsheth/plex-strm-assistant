@@ -11,6 +11,10 @@ RUN npm run build
 FROM node:22-alpine
 WORKDIR /app
 
+# ffmpeg provides ffprobe, used by the optional probe pass to read real stream
+# metadata (codecs, resolution, audio/subtitle tracks) from .strm source URLs.
+RUN apk add --no-cache ffmpeg
+
 # Production deps only (just 'commander' -- no native sqlite3, Node built-in is used)
 COPY package*.json ./
 RUN npm ci --omit=dev
@@ -25,6 +29,8 @@ ENV CONTAINER_PREFIX=/media/strm
 ENV STRM_PROXY_HOST=strm-proxy
 ENV STRM_ROOT=/strm
 ENV PORT=3000
+# PROBE_INTERVAL (seconds) is unset by default = periodic probing off.
+# Set it to enable automatic probing of new .strm files (see README).
 
 EXPOSE 3000
 
