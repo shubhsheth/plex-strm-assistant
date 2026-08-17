@@ -278,7 +278,14 @@ function insertStream(
     updated_at: now,
   };
   if (s.kind === 'audio') row['channels'] = s.channels;
-  if (s.kind !== 'video') row['language'] = s.language;
+  if (s.kind !== 'video' && s.language) {
+    // ffprobe reports an ISO 639-2 code (e.g. "eng"). Plex keys language display
+    // off language_code/language_tag; these are PRAGMA-guarded so absent columns
+    // on older schemas are skipped.
+    row['language'] = s.language;
+    row['language_code'] = s.language;
+    row['language_tag'] = s.language;
+  }
   if ((s.kind === 'video' || s.kind === 'audio') && s.bitrate != null) {
     row['bitrate'] = Math.round(s.bitrate / 1000); // kbps
   }
