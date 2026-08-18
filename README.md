@@ -141,6 +141,54 @@ SKIP_SETUP=true docker compose up -d strm-proxy
 
 ---
 
+## Probing source metadata
+
+By default Plex only gets the placeholder H.264/AAC pair the triggers seed, so items play immediately but show a single video + stereo audio track. The **probe pass** reads the real streams from each `.strm` source URL with `ffprobe` and writes accurate metadata into Plex: real video codec/resolution/frame rate, every audio track (codec, channels, language), embedded subtitle tracks, and duration. `ffmpeg` (which provides `ffprobe`) is bundled in the image.
+
+It is safe to re-run: a signature of each source URL is stored, so unchanged files are skipped unless you pass `--force`. Any sidecar `.srt` streams Plex discovered are left untouched.
+
+### Automatic (recommended): probe new files on an interval
+
+Set `PROBE_INTERVAL` to a number of seconds and the container probes on that cadence. New `.strm` files play instantly on the placeholder, then upgrade to real metadata within one interval — the signature cache keeps each cycle cheap.
+
+```yaml
+services:
+  strm-proxy:
+    image: liveinaus/plex-strm-assistant
+    environment:
+      - PROBE_INTERVAL=1800 # probe every 30 minutes
+    # ...volumes/ports as in the Quick start
+```
+
+> This writes to the Plex database while Plex is running. SQLite's WAL locking (with a busy timeout) serialises those writes safely. If you would rather never write to a running database, leave `PROBE_INTERVAL` unset and use the manual run below with Plex stopped.
+
+### Manual (one-off) run
+
+Run the probe pass on demand — for example the first time, or after adding a batch of files. As with trigger installation, stopping Plex first avoids writing to a running database:
+
+```bash
+docker compose run --rm strm-proxy \
+  node --experimental-sqlite /app/dist/probe-cli.js \
+    --db "$DB_PATH" \
+    --scan-strm /strm \
+    --rebase /strm:/media/strm \
+    --proxy-base http://strm-proxy:3000
+```
+
+Useful flags:
+
+| Flag                 | Description                                                       |
+| -------------------- | ----------------------------------------------------------------- |
+| `--dry-run`          | Report what would change without writing to the database          |
+| `--force`            | Re-probe every file, even ones whose source URL hasn't changed    |
+| `--concurrency <n>`  | How many URLs to probe in parallel (default `3`)                  |
+| `--probe-timeout <ms>` | Per-URL `ffprobe` timeout in milliseconds (default `30000`)     |
+| `--ffprobe-path <p>` | Path to the `ffprobe` binary (default `ffprobe`)                  |
+
+> The probe pass depends on Plex having already scanned the `.strm` file (so the `media_parts` row exists). Files Plex hasn't scanned yet are reported as `NOT IN DB` and picked up on a later run.
+
+---
+
 ## Configuration
 
 All variables are optional. The defaults match the Quick start layout, so you only need these if your mount paths or hostnames differ.
@@ -153,6 +201,8 @@ All variables are optional. The defaults match the Quick start layout, so you on
 | `CONTAINER_PREFIX` | `/media/strm`                                                                                                         | Path where `.strm` files are mounted inside the Plex container          |
 | `DB_PATH`          | `/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db` | Full path to the Plex database inside the proxy container               |
 | `SKIP_SETUP`       | `false`                                                                                                               | Set to `true` to skip trigger installation (safe while Plex is running) |
+| `PROBE_INTERVAL`   | _(unset)_                                                                                                             | Seconds between automatic probe passes. Unset = off (see [Probing source metadata](#probing-source-metadata)) |
+| `FFPROBE_PATH`     | `ffprobe`                                                                                                             | Path to the `ffprobe` binary used by the probe pass                     |
 
 ---
 
@@ -199,9 +249,11 @@ The proxy could not find the Plex database at `DB_PATH`. Make sure Plex has been
 
 ### Embedded subtitles or extra audio tracks are missing
 
-Plex is not given real stream data for a remote URL, so the triggers seed a placeholder H.264/AAC pair to keep direct play working. That placeholder describes one video and one stereo audio track only, so embedded subtitle and secondary audio tracks do not appear on their own. Real probing of the source is on the roadmap.
+Plex is not given real stream data for a remote URL, so the triggers seed a placeholder H.264/AAC pair to keep direct play working immediately. That placeholder describes one video and one stereo audio track only, so embedded subtitle and secondary audio tracks do not appear on their own.
 
-Sidecar subtitles do work in the meantime: put a `.srt` next to the `.strm` with a matching base name (`Movie (2008).strm` and `Movie (2008).en.srt`) and rescan the library. The triggers leave any stream Plex discovers in place, including on later rescans.
+To publish the **real** tracks (all audio, embedded subtitles, accurate resolution/codec/duration), run the probe pass — see [Probing source metadata](#probing-source-metadata). It replaces the placeholder with real per-track metadata read from the source with `ffprobe`.
+
+Sidecar subtitles also work: put a `.srt` next to the `.strm` with a matching base name (`Movie (2008).strm` and `Movie (2008).en.srt`) and rescan the library. Both the triggers and the probe pass leave any stream Plex discovers (sidecars included) in place.
 
 ### "Database disk image is malformed"
 
@@ -227,7 +279,7 @@ rm -f "${DB}-wal" "${DB}-shm"
 - [x] Multi-platform image (amd64, arm64)
 - [x] Safe first-run handling: waits for the Plex DB, `SKIP_SETUP` flag for restarts
 - [ ] Disable unnecessary Plex processing on `.strm` items (analysis, thumbnail generation, etc.)
-- [ ] Probe source URLs (ffprobe) to publish real audio and subtitle track metadata to Plex
+- [x] Probe source URLs (ffprobe) to publish real video, audio and subtitle track metadata to Plex
 - [ ] Follow 302 redirects from the source URL before returning to Plex, enabling compatibility with services that require a redirect step (e.g. 115 Drive)
 
 ---

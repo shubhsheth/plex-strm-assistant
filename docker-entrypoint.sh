@@ -36,5 +36,31 @@ else
     --proxy-base "$PROXY_BASE"
 fi
 
+# Optional periodic probe pass. Off by default; set PROBE_INTERVAL (seconds) to
+# enable. Each cycle spawns a fresh, short-lived process (so the DB handle is
+# released between runs) that probes source URLs and publishes real stream
+# metadata. The probe_sig cache means only new/changed .strm files do real work.
+#
+# NOTE: this writes to the live Plex DB while Plex is running. SQLite's WAL
+# locking (with a busy timeout) serialises this safely, but if you'd rather not
+# write to a running DB, leave this off and run the probe manually with Plex
+# stopped (see README).
+if [ -n "${PROBE_INTERVAL:-}" ]; then
+  echo "[strm-proxy] Periodic probe enabled (every ${PROBE_INTERVAL}s)"
+  (
+    while true; do
+      sleep "$PROBE_INTERVAL"
+      echo "[strm-proxy] Running probe pass..."
+      node --experimental-sqlite /app/dist/probe-cli.js \
+        --db "$DB" \
+        --scan-strm "${STRM_ROOT:-/strm}" \
+        --rebase "${STRM_ROOT:-/strm}:${CONTAINER_PREFIX}" \
+        --proxy-base "$PROXY_BASE" \
+        --ffprobe-path "${FFPROBE_PATH:-ffprobe}" \
+        || echo "[strm-proxy] probe pass failed (continuing)"
+    done
+  ) &
+fi
+
 echo "[strm-proxy] Starting proxy..."
 exec node /app/dist/proxy.js
