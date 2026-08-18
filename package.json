@@ -12,7 +12,7 @@
     "dev": "node --experimental-sqlite -r ts-node/register src/index.ts",
     "start": "node --experimental-sqlite dist/index.js",
     "probe": "node --experimental-sqlite dist/probe-cli.js",
-    "test": "node --test --require ts-node/register test/*.test.ts",
+    "test": "node --experimental-sqlite --test --require ts-node/register test/*.test.ts",
     "format": "prettier --write src/**/*.ts"
   },
   "dependencies": {

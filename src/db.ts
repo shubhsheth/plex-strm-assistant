@@ -60,6 +60,25 @@ export function findPartByContainerPath(
     if (byUrl) return toStrmPart(byUrl);
   }
 
+  // 4. Trigger-patched proxy URL. The setup.ts triggers rewrite `file` to
+  //    `<proxy-base>/<path-without-prefix>.mp4` using the RAW (un-encoded) path,
+  //    so neither the exact container path nor an encoded proxy URL matches.
+  //    Match instead on the raw path tail, which is stable regardless of proxy
+  //    host/port, prefix, and URL-encoding. Prefer the more-specific parent+base
+  //    tail; fall back to the bare basename for files at the mount root. Try both
+  //    .mp4 (trigger) and .strm (relocated-but-unpatched). A single-match guard
+  //    prevents mis-assigning when two files share the same tail.
+  for (const depth of [2, 1]) {
+    const tail = lastPathSegments(containerPath, depth);
+    for (const ext of ['.mp4', '.strm']) {
+      const suffix = tail.replace(/\.strm$/i, ext);
+      const rows = db
+        .prepare(select + `file LIKE ? ESCAPE '\\'`)
+        .all('%' + escapeLike(suffix)) as RawPart[];
+      if (rows.length === 1) return toStrmPart(rows[0]);
+    }
+  }
+
   return null;
 }
 
@@ -93,6 +112,16 @@ export function updatePartFile(
 }
 
 // -- types & helpers --
+
+/** Returns the last `n` slash-separated segments of a path, e.g. "Movie (2016)/Movie.strm". */
+function lastPathSegments(p: string, n: number): string {
+  return p.split('/').filter(Boolean).slice(-n).join('/');
+}
+
+/** Escapes SQLite LIKE wildcards so a literal path matches only itself (ESCAPE '\'). */
+function escapeLike(s: string): string {
+  return s.replace(/[\\%_]/g, (c) => '\\' + c);
+}
 
 type RawPart = Omit<StrmPart, 'strmSource'> & { extraData: string | null };
 
