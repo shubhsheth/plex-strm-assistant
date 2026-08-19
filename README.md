@@ -176,7 +176,7 @@ The filesystem-walking pass is still available as a backstop — handy for the f
 
 ```bash
 docker compose run --rm strm-proxy \
-  node --experimental-sqlite /app/dist/cli.js probe \
+  node --experimental-sqlite /app/dist/probe-cli.js \
     --db "$DB_PATH" \
     --scan-strm /strm \
     --rebase /strm:/media/strm \
