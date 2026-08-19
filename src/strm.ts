@@ -37,6 +37,48 @@ export function toContainerPath(localPath: string, rebase: string): string {
 }
 
 /**
+ * Reverse of toContainerPath: maps the container path Plex recorded back to the
+ * local on-disk path, so the worker can read the .strm file from a DB row.
+ */
+export function toLocalPath(containerPath: string, rebase: string): string {
+  const sep = rebase.indexOf(':');
+  if (sep === -1) return containerPath;
+  const localPrefix = path.resolve(rebase.slice(0, sep));
+  const containerPrefix = rebase.slice(sep + 1);
+  return containerPath.startsWith(containerPrefix)
+    ? localPrefix + containerPath.slice(containerPrefix.length)
+    : containerPath;
+}
+
+/**
+ * Recovers the original .strm container path from a proxy URL, for legacy rows
+ * that predate strm_source tracking. Reverse of toProxyUrl + the setup trigger's
+ * path transform: strip the proxy base, decode each segment, swap .mp4 -> .strm,
+ * and prepend the container prefix. Returns null if the URL is not under proxyBase.
+ */
+export function proxyUrlToContainerPath(
+  url: string,
+  proxyBase: string,
+  containerPrefix: string,
+): string | null {
+  const base = proxyBase.replace(/\/$/, '');
+  if (!url.startsWith(base)) return null;
+  const encodedPath = url.slice(base.length).split(/[?#]/)[0];
+  const decodedPath = encodedPath
+    .split('/')
+    .map((seg) => {
+      try {
+        return decodeURIComponent(seg);
+      } catch {
+        return seg;
+      }
+    })
+    .join('/');
+  const strmPath = decodedPath.replace(/\.[^./]+$/, '.strm');
+  return containerPrefix.replace(/\/$/, '') + strmPath;
+}
+
+/**
  * Builds the stable proxy URL for a container path.
  * Each path segment is percent-encoded so spaces and special chars are valid in the URL.
  * e.g. /media/strm/Movies/Big Buck Bunny (2008)/Big Buck Bunny (2008).strm

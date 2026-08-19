@@ -36,28 +36,36 @@ else
     --proxy-base "$PROXY_BASE"
 fi
 
-# Optional periodic probe pass. Off by default; set PROBE_INTERVAL (seconds) to
-# enable. Each cycle spawns a fresh, short-lived process (so the DB handle is
-# released between runs) that probes source URLs and publishes real stream
-# metadata. The probe_sig cache means only new/changed .strm files do real work.
+# Event-driven probe worker. Off by default; set PROBE_WORKER=true to enable
+# (a legacy PROBE_INTERVAL value also enables it and sets the poll interval).
+#
+# The auto-patch triggers enqueue each newly scanned .strm file into
+# strm_probe_queue; this worker drains that queue -- resolving each source URL,
+# running ffprobe, and publishing real stream metadata -- so only new or changed
+# files do real work, promptly, without re-walking the whole tree each cycle.
 #
 # NOTE: this writes to the live Plex DB while Plex is running. SQLite's WAL
 # locking (with a busy timeout) serialises this safely, but if you'd rather not
 # write to a running DB, leave this off and run the probe manually with Plex
 # stopped (see README).
-if [ -n "${PROBE_INTERVAL:-}" ]; then
-  echo "[strm-proxy] Periodic probe enabled (every ${PROBE_INTERVAL}s)"
+if [ "${PROBE_WORKER:-false}" = "true" ] || [ -n "${PROBE_INTERVAL:-}" ]; then
+  POLL="${PROBE_POLL_INTERVAL:-${PROBE_INTERVAL:-30}}"
+  echo "[strm-proxy] Probe worker enabled (poll every ${POLL}s)"
   (
+    # Respawn if the worker ever exits, so a transient fatal error self-heals.
     while true; do
-      sleep "$PROBE_INTERVAL"
-      echo "[strm-proxy] Running probe pass..."
-      node --experimental-sqlite /app/dist/probe-cli.js \
+      node --experimental-sqlite /app/dist/probe-worker.js \
         --db "$DB" \
-        --scan-strm "${STRM_ROOT:-/strm}" \
         --rebase "${STRM_ROOT:-/strm}:${CONTAINER_PREFIX}" \
         --proxy-base "$PROXY_BASE" \
         --ffprobe-path "${FFPROBE_PATH:-ffprobe}" \
-        || echo "[strm-proxy] probe pass failed (continuing)"
+        --poll-interval "$POLL" \
+        --concurrency "${PROBE_CONCURRENCY:-3}" \
+        --batch-size "${PROBE_BATCH_SIZE:-50}" \
+        --cooldown-ms "${PROBE_COOLDOWN_MS:-0}" \
+        --max-attempts "${PROBE_MAX_ATTEMPTS:-5}" \
+        || echo "[strm-proxy] probe worker exited (restarting in 10s)"
+      sleep 10
     done
   ) &
 fi

@@ -5,13 +5,15 @@
   "main": "dist/index.js",
   "bin": {
     "plex-strm-assistant": "dist/index.js",
-    "plex-strm-probe": "dist/probe-cli.js"
+    "plex-strm-probe": "dist/probe-cli.js",
+    "plex-strm-probe-worker": "dist/probe-worker.js"
   },
   "scripts": {
     "build": "tsc",
     "dev": "node --experimental-sqlite -r ts-node/register src/index.ts",
     "start": "node --experimental-sqlite dist/index.js",
     "probe": "node --experimental-sqlite dist/probe-cli.js",
+    "probe-worker": "node --experimental-sqlite dist/probe-worker.js",
     "test": "node --test --require ts-node/register test/*.test.ts",
     "format": "prettier --write src/**/*.ts"
   },

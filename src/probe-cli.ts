@@ -14,14 +14,8 @@
  */
 import { Command } from 'commander';
 import path from 'path';
-import {
-  DEFAULT_DB_PATH,
-  findPartByContainerPath,
-  openDb,
-  writeProbedStreams,
-  parseExtraDataField,
-} from './db';
-import { probeSignature, probeUrl } from './probe';
+import { DEFAULT_DB_PATH, findPartByContainerPath, openDb } from './db';
+import { mapPool, probeAndWritePart } from './probe-run';
 import { readStrmUrl, toContainerPath, toProxyUrl, walkStrm } from './strm';
 
 const program = new Command();
@@ -101,24 +95,28 @@ async function main(): Promise<void> {
       return;
     }
 
-    const sig = probeSignature(realUrl);
-    if (!opts.force && parseExtraDataField(part.extraData, 'probe_sig') === sig) {
+    const outcome = await probeAndWritePart(db, {
+      part,
+      realUrl,
+      force: opts.force ?? false,
+      dryRun: opts.dryRun ?? false,
+      ffprobePath: opts.ffprobePath,
+      timeoutMs,
+    });
+
+    if (outcome.status === 'skipped') {
       console.log(`  SKIP (unchanged)  id=${part.id}  ${containerPath}`);
       skipped++;
       return;
     }
-
-    const outcome = await probeUrl(realUrl, { ffprobePath: opts.ffprobePath, timeoutMs });
-    if (!outcome.ok) {
+    if (outcome.status === 'failed') {
       console.warn(`  FAILED  id=${part.id}  ${containerPath}\n          ${outcome.error}`);
       failed++;
       return;
     }
 
-    const result = outcome.result;
-    writeProbedStreams(db, part, result, sig, opts.dryRun ?? false);
     const label = opts.dryRun ? 'WOULD PROBE' : 'PROBED';
-    console.log(`  ${label}  id=${part.id}  ${describe(result)}`);
+    console.log(`  ${label}  id=${part.id}  ${outcome.summary}`);
     console.log(`    ${containerPath}`);
     probed++;
   });
@@ -130,36 +128,6 @@ async function main(): Promise<void> {
     `failed=${failed}`,
   ];
   console.log(`\nDone. ${summary.join('  ')}`);
-}
-
-/** One-line human summary of a probe result. */
-function describe(result: import('./probe').ProbeResult): string {
-  const v = result.streams.find((s) => s.kind === 'video');
-  const audio = result.streams.filter((s) => s.kind === 'audio').length;
-  const subs = result.streams.filter((s) => s.kind === 'subtitle').length;
-  const parts: string[] = [];
-  if (v && v.kind === 'video') {
-    parts.push(`${v.codec}${v.width && v.height ? ` ${v.width}x${v.height}` : ''}`);
-  }
-  parts.push(`${audio} audio`);
-  parts.push(`${subs} subtitle`);
-  return parts.join('  ');
-}
-
-/** Runs `fn` over items with a bounded number of concurrent workers. */
-async function mapPool<T>(
-  items: T[],
-  limit: number,
-  fn: (item: T) => Promise<void>,
-): Promise<void> {
-  let next = 0;
-  const worker = async (): Promise<void> => {
-    while (next < items.length) {
-      const i = next++;
-      await fn(items[i]);
-    }
-  };
-  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
 }
 
 main().catch((err) => {
