@@ -422,7 +422,7 @@ function insertStream(
 
 /**
  * Best-effort per-stream attributes for media_streams.extra_data, using Plex's
- * `ma:`-namespaced URL-encoded form. First-class columns above carry the data
+ * `ma:`-namespaced keys serialized as JSON. First-class columns above carry the data
  * Plex reliably displays; these deeper attributes (profile, bit depth, colour,
  * forced/default, track title) are layered on top and should be spot-checked
  * against a live Plex DB, as the exact key set varies by Plex version.
@@ -446,9 +446,7 @@ function encodeStreamExtraData(s: ProbeStream): string {
     if (s.forced) kv['ma:forced'] = 1;
     if (s.default) kv['ma:default'] = 1;
   }
-  return Object.entries(kv)
-    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-    .join('&');
+  return JSON.stringify(kv);
 }
 
 /** Maps a pixel height to Plex's video_resolution label. */
