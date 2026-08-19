@@ -15,7 +15,13 @@
  * handle non-ASCII characters.
  */
 import { Command } from 'commander';
-import { DEFAULT_DB_PATH, openDb } from './db';
+import {
+  DEFAULT_DB_PATH,
+  PROBE_QUEUE_DDL,
+  backfillQueue,
+  createProbeQueueTable,
+  openDb,
+} from './db';
 
 const program = new Command();
 
@@ -76,6 +82,14 @@ const streamInfoSql = `
     SELECT 1 FROM media_streams
     WHERE media_part_id = NEW.id AND stream_type_id = 2);`;
 
+// Enqueue the freshly scanned part for real ffprobe metadata. A trigger cannot
+// run ffprobe (pure SQL, and it fires inside Plex's write transaction), so it
+// just records the id; the out-of-process probe worker drains the queue. INSERT
+// OR IGNORE keeps a single pending row per part across rescans.
+const enqueueSql = `
+  INSERT OR IGNORE INTO strm_probe_queue (media_part_id, enqueued_at, updated_at)
+  VALUES (NEW.id, strftime('%s','now'), strftime('%s','now'));`;
+
 const insertTriggerSql = `
 CREATE TRIGGER IF NOT EXISTS strm_auto_patch_insert
 AFTER INSERT ON media_parts
@@ -85,6 +99,7 @@ BEGIN
   SET file = ${proxyUrlExpr('NEW.file')}
   WHERE id = NEW.id;
   ${streamInfoSql}
+  ${enqueueSql}
 END`;
 
 const updateTriggerSql = `
@@ -96,6 +111,7 @@ BEGIN
   SET file = ${proxyUrlExpr('NEW.file')}
   WHERE id = NEW.id;
   ${streamInfoSql}
+  ${enqueueSql}
 END`;
 
 const patchExistingSql = `
@@ -104,13 +120,18 @@ SET file = ${proxyUrlExpr('file')}
 WHERE file LIKE '${likePattern}'`;
 
 if (opts.dryRun) {
-  console.log('-- INSERT trigger\n' + insertTriggerSql);
+  console.log('-- Probe work queue table\n' + PROBE_QUEUE_DDL);
+  console.log('\n-- INSERT trigger\n' + insertTriggerSql);
   console.log('\n-- UPDATE trigger\n' + updateTriggerSql);
   console.log('\n-- Patch existing rows\n' + patchExistingSql);
   process.exit(0);
 }
 
 const db = openDb(opts.db);
+
+// The triggers enqueue into strm_probe_queue, so the table must exist first.
+createProbeQueueTable(db);
+console.log('Ensured probe work queue table: strm_probe_queue');
 
 // Drop old triggers so they are replaced with the updated SQL
 db.exec(`DROP TRIGGER IF EXISTS strm_proxy_guard`);
@@ -166,6 +187,13 @@ db.exec(seedStreamsSql);
 db.exec(seedAudioSql);
 if (itemsUpdated.changes > 0) {
   console.log(`Seeded stream info (h264/aac) for ${itemsUpdated.changes} existing proxy item(s).`);
+}
+
+// Enqueue already-scanned .strm rows that were never probed, so the worker
+// picks them up without waiting for a Plex rescan.
+const queued = backfillQueue(db, opts.proxyBase);
+if (queued > 0) {
+  console.log(`Queued ${queued} un-probed .strm row(s) for the probe worker.`);
 }
 
 console.log('\nSetup complete. Plex rescans and new .strm files are now handled automatically.');

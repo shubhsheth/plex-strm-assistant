@@ -169,6 +169,126 @@ export function guardTriggerExists(db: DatabaseSync): boolean {
   return row != null;
 }
 
+// -- probe work queue --
+//
+// The auto-patch triggers enqueue a media_part_id here the moment Plex scans a
+// .strm file (a pure SQL INSERT -- a trigger cannot run ffprobe itself). The
+// long-running probe worker drains this queue out of process: it resolves the
+// source URL, runs ffprobe, writes results into the Plex tables, then deletes
+// the row. A present row means "pending"; failures back off and eventually park.
+
+/** Loads a single media_parts row by id (used by the queue-draining worker). */
+export function findPartById(db: DatabaseSync, id: number): StrmPart | null {
+  const raw = db
+    .prepare(
+      `SELECT id, file, size, media_item_id AS mediaItemId, extra_data AS extraData
+       FROM media_parts WHERE id = ? AND deleted_at IS NULL`,
+    )
+    .get(id) as RawPart | undefined;
+  return raw ? toStrmPart(raw) : null;
+}
+
+export const PROBE_QUEUE_DDL = `CREATE TABLE IF NOT EXISTS strm_probe_queue (
+  media_part_id   INTEGER PRIMARY KEY,
+  enqueued_at     INTEGER NOT NULL,
+  attempts        INTEGER NOT NULL DEFAULT 0,
+  last_error      TEXT,
+  next_attempt_at INTEGER NOT NULL DEFAULT 0,
+  updated_at      INTEGER NOT NULL
+)`;
+
+/** Creates the probe work-queue table if it does not exist. Must run before the triggers reference it. */
+export function createProbeQueueTable(db: DatabaseSync): void {
+  db.exec(PROBE_QUEUE_DDL);
+}
+
+/** Enqueues a media_part_id for probing. Idempotent -- a pending row is left untouched. */
+export function enqueuePart(db: DatabaseSync, mediaPartId: number): void {
+  const now = Math.floor(Date.now() / 1000);
+  db.prepare(
+    `INSERT OR IGNORE INTO strm_probe_queue (media_part_id, enqueued_at, updated_at)
+     VALUES (?, ?, ?)`,
+  ).run(mediaPartId, now, now);
+}
+
+export type QueueItem = { mediaPartId: number; attempts: number };
+
+/** Returns up to `limit` due pending items (next_attempt_at reached), oldest first. */
+export function claimQueueBatch(
+  db: DatabaseSync,
+  limit: number,
+  now = Math.floor(Date.now() / 1000),
+): QueueItem[] {
+  return db
+    .prepare(
+      `SELECT media_part_id AS mediaPartId, attempts
+       FROM strm_probe_queue
+       WHERE next_attempt_at <= ?
+       ORDER BY enqueued_at
+       LIMIT ?`,
+    )
+    .all(now, limit) as QueueItem[];
+}
+
+/** Removes a drained item from the queue (probe succeeded, skipped, or unresolvable). */
+export function markProbed(db: DatabaseSync, mediaPartId: number): void {
+  db.prepare(`DELETE FROM strm_probe_queue WHERE media_part_id = ?`).run(mediaPartId);
+}
+
+export type FailOutcome = 'retry' | 'parked';
+
+/**
+ * Records a probe failure: increments attempts, stores the error, and schedules
+ * the next attempt with exponential backoff. Once attempts reaches `maxAttempts`
+ * the item is parked (removed) so a permanently broken URL cannot spin forever --
+ * a later Plex rescan (or the full-sweep backstop) will re-enqueue it if fixed.
+ */
+export function markFailed(
+  db: DatabaseSync,
+  mediaPartId: number,
+  error: string,
+  opts: { maxAttempts: number; baseBackoffSec: number },
+): FailOutcome {
+  const now = Math.floor(Date.now() / 1000);
+  const row = db
+    .prepare(`SELECT attempts FROM strm_probe_queue WHERE media_part_id = ?`)
+    .get(mediaPartId) as { attempts: number } | undefined;
+  const attempts = (row?.attempts ?? 0) + 1;
+
+  if (attempts >= opts.maxAttempts) {
+    db.prepare(`DELETE FROM strm_probe_queue WHERE media_part_id = ?`).run(mediaPartId);
+    return 'parked';
+  }
+
+  const backoff = opts.baseBackoffSec * 2 ** (attempts - 1);
+  db.prepare(
+    `UPDATE strm_probe_queue
+     SET attempts = ?, last_error = ?, next_attempt_at = ?, updated_at = ?
+     WHERE media_part_id = ?`,
+  ).run(attempts, error.slice(0, 500), now + backoff, now, mediaPartId);
+  return 'retry';
+}
+
+/**
+ * Enqueues existing proxy-URL rows that have never been probed (no probe_sig in
+ * extra_data). Run once on setup/upgrade so already-scanned .strm files are
+ * picked up by the worker without waiting for a Plex rescan. Returns rows added.
+ */
+export function backfillQueue(db: DatabaseSync, proxyBase: string): number {
+  const now = Math.floor(Date.now() / 1000);
+  const base = proxyBase.replace(/\/$/, '');
+  const res = db
+    .prepare(
+      `INSERT OR IGNORE INTO strm_probe_queue (media_part_id, enqueued_at, updated_at)
+       SELECT mp.id, ?, ?
+       FROM media_parts mp
+       WHERE mp.file LIKE ? AND mp.deleted_at IS NULL
+         AND (mp.extra_data IS NULL OR mp.extra_data NOT LIKE '%"probe_sig"%')`,
+    )
+    .run(now, now, base + '%');
+  return Number(res.changes);
+}
+
 // -- probe results -> Plex DB --
 
 export type ProbeWriteOutcome = {

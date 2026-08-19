@@ -147,24 +147,32 @@ By default Plex only gets the placeholder H.264/AAC pair the triggers seed, so i
 
 It is safe to re-run: a signature of each source URL is stored, so unchanged files are skipped unless you pass `--force`. Any sidecar `.srt` streams Plex discovered are left untouched.
 
-### Automatic (recommended): probe new files on an interval
+### Automatic (recommended): event-driven probe worker
 
-Set `PROBE_INTERVAL` to a number of seconds and the container probes on that cadence. New `.strm` files play instantly on the placeholder, then upgrade to real metadata within one interval — the signature cache keeps each cycle cheap.
+Probing is driven off the same triggers that patch the paths, so it reacts to Plex scans instead of blindly re-walking the library. This mirrors how the mature Jellyfin/Emby STRM probers work — a catch-up queue fed by scan events, drained by a background worker.
+
+The moment Plex scans a `.strm` file, the auto-patch trigger enqueues its `media_parts` row into a small work table, **`strm_probe_queue`**. A SQLite trigger can't run `ffprobe` itself (it is pure SQL, executing inside Plex's write transaction), so it just records the id. A long-running **probe worker** drains the queue out of process: it recovers each source URL, runs `ffprobe`, writes real metadata, and removes the row. Failures back off exponentially and are parked after a few attempts so a broken URL can't spin.
+
+Set `PROBE_WORKER=true` to enable it. New `.strm` files play instantly on the placeholder, then upgrade to real metadata within one poll interval (default 30s).
 
 ```yaml
 services:
   strm-proxy:
     image: liveinaus/plex-strm-assistant
     environment:
-      - PROBE_INTERVAL=1800 # probe every 30 minutes
+      - PROBE_WORKER=true
+      - PROBE_POLL_INTERVAL=30 # seconds between queue polls (optional)
+      - PROBE_COOLDOWN_MS=0 # delay after each probe, to spare the source (optional)
     # ...volumes/ports as in the Quick start
 ```
 
-> This writes to the Plex database while Plex is running. SQLite's WAL locking (with a busy timeout) serialises those writes safely. If you would rather never write to a running database, leave `PROBE_INTERVAL` unset and use the manual run below with Plex stopped.
+> This writes to the Plex database while Plex is running. SQLite's WAL locking (with a busy timeout) serialises those writes safely. If you would rather never write to a running database, leave `PROBE_WORKER` unset and use the manual run below with Plex stopped.
+>
+> Upgrading: a previously set `PROBE_INTERVAL` still enables the worker (and sets its poll interval), so existing setups keep probing automatically — now event-driven rather than a full re-walk each cycle.
 
-### Manual (one-off) run
+### Manual (one-off) full sweep
 
-Run the probe pass on demand — for example the first time, or after adding a batch of files. As with trigger installation, stopping Plex first avoids writing to a running database:
+The filesystem-walking pass is still available as a backstop — handy for the first bulk population, or to re-queue anything the event path missed. As with trigger installation, stopping Plex first avoids writing to a running database:
 
 ```bash
 docker compose run --rm strm-proxy \
@@ -201,7 +209,13 @@ All variables are optional. The defaults match the Quick start layout, so you on
 | `CONTAINER_PREFIX` | `/media/strm`                                                                                                         | Path where `.strm` files are mounted inside the Plex container          |
 | `DB_PATH`          | `/plex-config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db` | Full path to the Plex database inside the proxy container               |
 | `SKIP_SETUP`       | `false`                                                                                                               | Set to `true` to skip trigger installation (safe while Plex is running) |
-| `PROBE_INTERVAL`   | _(unset)_                                                                                                             | Seconds between automatic probe passes. Unset = off (see [Probing source metadata](#probing-source-metadata)) |
+| `PROBE_WORKER`     | `false`                                                                                                               | Set to `true` to run the event-driven probe worker (see [Probing source metadata](#probing-source-metadata)) |
+| `PROBE_POLL_INTERVAL` | `30`                                                                                                             | Seconds the worker waits between queue polls                            |
+| `PROBE_CONCURRENCY` | `3`                                                                                                                 | How many URLs the worker probes in parallel                            |
+| `PROBE_COOLDOWN_MS` | `0`                                                                                                                 | Delay after each probe, to avoid overloading the source                |
+| `PROBE_BATCH_SIZE` | `50`                                                                                                                 | Max queue items the worker claims per poll                             |
+| `PROBE_MAX_ATTEMPTS` | `5`                                                                                                               | Attempts before a failing item is parked (given up on)                 |
+| `PROBE_INTERVAL`   | _(unset)_                                                                                                             | Legacy alias: if set, enables the worker and sets its poll interval     |
 | `FFPROBE_PATH`     | `ffprobe`                                                                                                             | Path to the `ffprobe` binary used by the probe pass                     |
 
 ---
@@ -280,6 +294,7 @@ rm -f "${DB}-wal" "${DB}-shm"
 - [x] Safe first-run handling: waits for the Plex DB, `SKIP_SETUP` flag for restarts
 - [ ] Disable unnecessary Plex processing on `.strm` items (analysis, thumbnail generation, etc.)
 - [x] Probe source URLs (ffprobe) to publish real video, audio and subtitle track metadata to Plex
+- [x] Event-driven probing: triggers enqueue scanned files, a background worker drains the queue (no full re-walk)
 - [ ] Follow 302 redirects from the source URL before returning to Plex, enabling compatibility with services that require a redirect step (e.g. 115 Drive)
 
 ---
